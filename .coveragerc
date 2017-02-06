@@ -1,0 +1,3 @@
+[run]
+omit = spatialingestor/main.py
+source = spatialingestor

@@ -1,0 +1,6 @@
+ckanserviceprovider==0.0.5
+gdal
+html5lib==0.9999999
+lxml
+psycopg2
+requests==2.5.0
