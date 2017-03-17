@@ -68,6 +68,16 @@ class HTTPError(util.JobError):
         }
 
 
+#Generate the file paths to traverse, or a single path if a file name was given
+def getfiles(path):
+    if os.path.isdir(path):
+        for root, dirs, files in os.walk(path):
+            for name in files:
+                yield os.path.join(root, name)
+    else:
+        yield path
+
+
 def get_url(action, ckan_url):
     """
     Get url for ckan action
@@ -306,6 +316,21 @@ def db_upload(data, parent_resource, input_format, table_name, logger):
                 unzip_dir = unzip_file(zpf, base_filepath)
             except:
                 raise util.JobError("{0} is not a valid zip file".format(base_filepath))
+
+            # Flatten the zip file
+            for root, dirs, files in os.walk(unzip_dir):
+                for sub_dir in dirs:
+                    from_dir = os.path.join(root, sub_dir)
+                    for f in getfiles(from_dir):
+                        filename = f.split('/')[-1]
+                        if os.path.isfile(os.path.join(unzip_dir, filename)):
+                            filename = f.replace(from_dir, "", 1).replace("/", "_")
+                        shutil.copy(f, os.path.join(unzip_dir, filename))
+                    shutil.rmtree(from_dir)
+
+            for f in os.listdir(unzip_dir):
+                if f.lower().endswith(".kml"):
+                    kml_file = os.path.join(unzip_dir, f)
 
             try:
                 os.remove(os.path.join(base_filepath))
@@ -778,7 +803,7 @@ def spatial_ingest(task_id, input):
     table_name = setup_spatial_table(data, resource)
 
     # Determine input format
-    logger.info('Determing input format for resource')
+    logger.info('Determining input format for resource')
 
     input_format = get_spatial_input_format(resource)
 
