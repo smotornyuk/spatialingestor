@@ -89,6 +89,13 @@ def get_url(action, ckan_url):
         ckan_url=ckan_url, action=action)
 
 
+def _add_geoserver_internal_url(data):
+    data['geoserver_internal_url'] = 'http://' + data['geoserver']['db_host']
+    if data['geoserver'].get('db_port', '') != '':
+        data['geoserver_internal_url'] += ':' + data['geoserver']['db_port']
+    data['geoserver_internal_url'] += '/' + data['geoserver']['db_name'] + '/'
+    
+
 def check_response(response, request_url, who, good_status=(201, 200), ignore_no_success=False):
     """
     Checks the response and raises exceptions if something went terribly wrong
@@ -169,7 +176,7 @@ def validate_input(input):
     if missing_db_metadata_keys:
         raise util.JobError('Missing DB metadata keys: {0}'.format(missing_db_metadata_keys))
 
-        required_geoserver_metadata_keys = required_db_metadata_keys
+    required_geoserver_metadata_keys = required_db_metadata_keys
 
     missing_geoserver_metadata_keys = required_geoserver_metadata_keys - set(input['metadata']['geoserver'].keys())
 
@@ -180,7 +187,7 @@ def validate_input(input):
 def get_spatial_input_format(resource):
     check_string = resource.get('__extras', {}).get('format', resource.get('format', resource.get('url', ''))).upper()
 
-    if any([check_string.endswith(x) for x in ["SHP", "SHAPEFILE"]]):
+    if any([x in check_string for x in ["SHP", "SHAPEFILE"]]):
         return 'SHP'
     elif check_string.endswith("KML"):
         return 'KML'
@@ -291,14 +298,16 @@ def db_upload(data, parent_resource, input_format, table_name, logger):
         if 'db_port' in data['postgis']:
             port_string = '\' port=\'' + data['postgis']['db_port']
 
-        args = ['', '-f', 'PostgreSQL', "--config", "PG_USE_COPY", "YES",
-                'PG:dbname=\'' + data['postgis']['db_name'] + '\' host=\'' + data['postgis'][
-                    'db_host'] + port_string + '\' user=\'' + data['postgis'][
-                    'db_user'] + '\' password=\'' + data['postgis']['db_pass'] + '\'', full_file_path, '-lco',
-                'GEOMETRY_NAME=geom', "-lco", "PRECISION=NO", '-nln', table_name, '-a_srs', crs,
-                '-nlt', 'PROMOTE_TO_MULTI', '-overwrite']
+        args = [
+            'ogr2ogr', '-f', 'PostgreSQL', "--config", "PG_USE_COPY", "YES",
+            'PG:dbname=\'' + data['postgis']['db_name'] + '\' host=\'' + 
+            data['postgis']['db_host'] + port_string + '\' user=\'' + 
+            data['postgis']['db_user'] + '\' password=\'' + data['postgis']['db_pass'] + 
+            '\'', full_file_path, '-lco', 'GEOMETRY_NAME=geom', "-lco", "PRECISION=NO", 
+            '-nln', table_name, '-a_srs', crs, '-nlt', 'PROMOTE_TO_MULTI', '-overwrite']
 
-        return ogr2ogr.main(pargs)
+        # return ogr2ogr.main(args)
+        return call(args)
 
     tempdir = tempfile.mkdtemp()
 
@@ -497,11 +506,7 @@ def geoserver_transfer(data, package, input_format, native_crs, table_name, logg
         raise util.JobError("Failed to extract data from PostGIS with exception: {0}".format(str(e)))
 
     # Construct geoserver url & name core
-    data['geoserver_internal_url'] = 'http://' + data['geoserver']['db_host']
-    if data['geoserver'].get('db_port', '') != '':
-        data['geoserver_internal_url'] += ':' + data['geoserver']['db_port']
-    data['geoserver_internal_url'] += '/' + data['geoserver']['db_name'] + '/'
-
+    _add_geoserver_internal_url(data)
     core_name = package['name'] + "_" + data['resource_id']
     headers = {'Content-type': 'application/json'}
     credentials = (data['geoserver']['db_user'], data['geoserver']['db_pass'])
@@ -589,8 +594,45 @@ def geoserver_transfer(data, package, input_format, native_crs, table_name, logg
         logger.info("Geoserver feature type creation of {0} failed with response {1}, continuing...".format(fturl, res))
     else:
         logger.info("Geoserver feature type creation of {0} succeeded".format(fturl))
-
+    for res in package['resources']:
+        _upsert_workspace_style(data['geoserver_internal_url'], workspace, res, credentials, logger)
     return workspace, layer, bbox_obj
+
+
+def _upsert_workspace_style(geoserver_url, ws, res, credentials, logger):
+    # create styles
+    sldurl = geoserver_url + 'rest/workspaces/' + ws + '/styles'
+    sldheaders={'Content-type': 'application/vnd.ogc.sld+xml'}
+    if res.get('format', '').upper() != 'SLD':
+        return
+    name = os.path.splitext(os.path.basename(res['url']))[0]
+    content = requests.get(res['url']).content
+    style_url = sldurl + '/' + name + '.xml'
+    r = requests.get(
+        style_url,
+        params={'quietOnNotFound': True},
+        auth=credentials)
+    logger.info('{0} response for {1} url'.format(r, style_url))
+    if r.ok:
+        action_type = 'update'
+        action = requests.put
+        url = style_url
+        params={}
+    else:
+        action_type = 'creation'
+        action = requests.post
+        url = sldurl + '.xml'
+        params = {'name': name}
+
+    res = action(
+        url, data=content, 
+        params=params, headers=sldheaders, 
+        auth=credentials)
+
+    if res.status_code != 200:
+        logger.info("Geoserver style {2} of {0} failed with response {1}, continuing...".format(sldurl, res, action_type))
+    else:
+        logger.info("Geoserver style {1} of {0} succeeded".format(sldurl, action_type))
 
 
 def purge_legacy_spatial(data, package, logger):
@@ -642,12 +684,7 @@ def purge_legacy_spatial(data, package, logger):
     # Delete workspace, datastore and any feature types associated with the legacy dataset
     try:
         logger.info("Purging legacy Geoserver assets, if they exist")
-
-        data['geoserver_internal_url'] = 'http://' + data['geoserver']['db_host']
-        if data['geoserver'].get('db_port', '') != '':
-            data['geoserver_internal_url'] += ':' + data['geoserver']['db_port']
-        data['geoserver_internal_url'] += '/' + data['geoserver']['db_name'] + '/'
-
+        _add_geoserver_internal_url(data)
         credentials = (data['geoserver']['db_user'], data['geoserver']['db_pass'])
 
         pkg_names = list(pkg_names)
@@ -859,11 +896,7 @@ def spatial_purge(task_id, input):
     logger.info('Purging Geoserver assets')
 
     # Construct geoserver url & name core
-    data['geoserver_internal_url'] = 'http://' + data['geoserver']['db_host']
-    if data['geoserver'].get('db_port', '') != '':
-        data['geoserver_internal_url'] += ':' + data['geoserver']['db_port']
-    data['geoserver_internal_url'] += '/' + data['geoserver']['db_name'] + '/'
-
+    _add_geoserver_internal_url(data)
     core_name = data['package_name'] + "_" + data['resource_id']
     credentials = (data['geoserver']['db_user'], data['geoserver']['db_pass'])
 
@@ -877,3 +910,37 @@ def spatial_purge(task_id, input):
         logger.info("Recursive deletion of Geoserver workspace {0} failed with error {1}".format(wsurl + '/' + workspace + '?recurse=true&quietOnNotFound', res))
     else:
         logger.info("Recursive deletion of Geoserver workspace {0} succeeded".format(wsurl + '/' + workspace + '?recurse=true&quietOnNotFound'))
+
+
+
+@job.async
+def spatial_update_styles(task_id, input):
+    handler = util.StoringHandler(task_id, input)
+    logger = logging.getLogger(task_id)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+    validate_input(input)
+
+    data = input['metadata']
+    data['api_key'] = input['api_key']
+    _add_geoserver_internal_url(data)
+    logger.info('Retrieving resource information')
+
+    resource = ckan_command('resource_show', {'id': data['resource_id']}, data)
+    package = ckan_command('package_show', {'id': resource['package_id']}, data)
+
+    logger.info('Retrieving package information')
+    credentials = (data['geoserver']['db_user'], data['geoserver']['db_pass'])
+    for res in package['resources']:
+        if 'SHP' in res.get('format', '').upper():
+            shp_res_id = res['id']
+            break
+    else:
+        logger.info('SHP resource not found in {0}'.format(resource['package_id']))
+        return
+    ws = 'ws_' + package['name'] + "_" + shp_res_id
+    for res in package['resources']:
+        if 'SLD' in res.get('format', '').upper():
+            _upsert_workspace_style(data['geoserver_internal_url'], 
+                                    ws, res, credentials, logger)
