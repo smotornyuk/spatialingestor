@@ -195,6 +195,8 @@ def get_spatial_input_format(resource):
         return 'KMZ'
     elif check_string.endswith("GRID"):
         return 'GRID'
+    elif check_string.endswith("TAB"):
+        return 'TAB'
     else:
         raise util.JobError("Failed to determine spatial file type for {0}".format(resource.get('url', '')))
 
@@ -238,7 +240,7 @@ def db_upload(data, parent_resource, input_format, table_name, logger):
             tmpname = '{0}.{1}'.format(uuid.uuid1(), 'kml')
         elif 'KMZ' == file_format:
             tmpname = '{0}.{1}'.format(uuid.uuid1(), 'kml.zip')
-        elif 'GRID' == file_format:
+        elif file_format in ('TAB', 'GRID'):
             tmpname = '{0}.{1}'.format(uuid.uuid1(), 'zip')
 
         if tmpname is None:
@@ -304,8 +306,9 @@ def db_upload(data, parent_resource, input_format, table_name, logger):
             data['postgis']['db_host'] + port_string + '\' user=\'' + 
             data['postgis']['db_user'] + '\' password=\'' + data['postgis']['db_pass'] + 
             '\'', full_file_path, '-lco', 'GEOMETRY_NAME=geom', "-lco", "PRECISION=NO", 
-            '-nln', table_name, '-a_srs', crs, '-nlt', 'PROMOTE_TO_MULTI', '-overwrite']
-
+            '-nln', table_name,'-nlt', 'PROMOTE_TO_MULTI', '-overwrite',]
+        if crs is not None:
+            args +=  ['-a_srs', crs]
         # return ogr2ogr.main(args)
         return call(args)
 
@@ -319,7 +322,7 @@ def db_upload(data, parent_resource, input_format, table_name, logger):
         base_filepath = download_file(parent_resource, input_format)
 
         # Do we need to unzip?
-        if input_format in ["KMZ", "SHP", "GRID"]:
+        if input_format in ["KMZ", "SHP", "GRID", "TAB"]:
             try:
                 zpf = zipfile.ZipFile(base_filepath)
                 unzip_dir = unzip_file(zpf, base_filepath)
@@ -396,6 +399,24 @@ def db_upload(data, parent_resource, input_format, table_name, logger):
                 raise util.JobError("Ogr2ogr failed to ingest KML file {0} into PostGIS DB".format(kml_file_new))
             else:
                 logger.info("Ogr2ogr successfully ingested KML file {0} into PostGIS DB".format(kml_file_new))
+
+        elif input_format in ('TAB',):
+            logger.info('Start TAB unzipping')
+            if unzip_dir is not None:
+                for f in os.listdir(unzip_dir):
+                    if f.lower().endswith(".tab"):
+                        tab_file = os.path.join(unzip_dir, f)
+                        break
+                else:
+                    raise util.JobError("No TAB file found in expanded archive {0}".format(unzip_dir))
+            else:
+                tab_file = base_filepath
+            return_code = db_ingest(tab_file, None)
+            if return_code == 1:
+                raise util.JobError("Ogr2ogr failed to ingest TAB file {0} into PostGIS DB".format(tab_file))
+            else:
+                logger.info("Ogr2ogr successfully ingested TAB file {0} into PostGIS DB".format(tab_file))
+
 
         elif input_format == "SHP":
 
